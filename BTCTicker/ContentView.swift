@@ -5,7 +5,7 @@ import Combine
 // MARK: - WebSocket 数据模型
 struct OKXResponse: Codable {
     let data: [TickerData]?
-    let event: String? // 用于识别 pong 等事件
+    let event: String?
 }
 struct TickerData: Codable {
     let last: String
@@ -17,10 +17,10 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private var webSocketTask: URLSessionWebSocketTask?
     private let url = URL(string: "wss://ws.okx.com:8443/ws/v5/public")!
     
-    // 自动重连与心跳管理
     private var reconnectTimer: Timer?
     private var pingTimer: Timer?
     private var isIntentionallyDisconnected = false
+    private var globalMonitor: Any?
 
     override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -31,7 +31,22 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
         
         setupMenu()
+        setupGlobalShortcut() // 初始化全局快捷键
         connectWebSocket()
+    }
+    
+    // MARK: - 全局快捷键设置
+    private func setupGlobalShortcut() {
+        // Command + Shift + Control + D
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return }
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let isTargetModifiers = modifiers.contains([.command, .shift, .control])
+            let isDKey = event.keyCode == 2 // kVK_ANSI_D
+            if isTargetModifiers && isDKey {
+                self.manualReset()
+            }
+        }
     }
     
     private func setupMenu() {
@@ -39,7 +54,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         
-        let refreshItem = NSMenuItem(title: "手动重连", action: #selector(manualReset), keyEquivalent: "r")
+        // 菜单项里也显示快捷键提示
+        let refreshItem = NSMenuItem(title: "手动重连", action: #selector(manualReset), keyEquivalent: "d")
+        refreshItem.keyEquivalentModifierMask = [.command, .shift, .control]
         refreshItem.target = self
         menu.addItem(refreshItem)
         
@@ -53,7 +70,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc func manualReset() {
-        print("手动触发重连...")
+        print("全局快捷键/菜单：手动触发重连...")
+        // 视觉反馈：改变标题让用户知道快捷键生效了
+        updateTitle("🔄 重连中")
         reconnect()
     }
 
@@ -66,7 +85,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     // MARK: - WebSocket 核心逻辑
     func connectWebSocket() {
-        // 重置状态
         stopTimers()
         isIntentionallyDisconnected = false
         
@@ -74,11 +92,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
         webSocketTask = session.webSocketTask(with: url)
         webSocketTask?.resume()
         
-        // 1. 发送订阅
         sendSubscribeMessage()
-        // 2. 开始接收消息
         receiveMessage()
-        // 3. 启动心跳 (每20秒发送一次 ping)
         startPingTimer()
     }
     
@@ -91,26 +106,19 @@ class StatusBarController: NSObject, NSMenuDelegate {
         """
         let message = URLSessionWebSocketTask.Message.string(subscribeMsg)
         webSocketTask?.send(message) { error in
-            if let error = error {
-                print("订阅发送失败: \(error)")
-            }
+            if let error = error { print("订阅失败: \(error)") }
         }
     }
 
     private func receiveMessage() {
         webSocketTask?.receive { [weak self] result in
             guard let self = self else { return }
-            
             switch result {
             case .success(let message):
-                if case .string(let text) = message {
-                    self.parsePrice(text)
-                }
-                // 成功后继续监听
+                if case .string(let text) = message { self.parsePrice(text) }
                 self.receiveMessage()
-                
             case .failure(let error):
-                print("WebSocket 连接丢失: \(error.localizedDescription)")
+                print("连接丢失: \(error.localizedDescription)")
                 if !self.isIntentionallyDisconnected {
                     self.updateTitle("重连中...")
                     self.scheduleReconnect()
@@ -119,22 +127,15 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
     
-    // MARK: - 心跳与重连机制
     private func startPingTimer() {
         pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-            self?.webSocketTask?.send(.string("ping")) { error in
-                if let error = error {
-                    print("Ping 失败: \(error)")
-                }
-            }
+            self?.webSocketTask?.send(.string("ping")) { _ in }
         }
     }
     
     private func scheduleReconnect() {
-        // 防止重复开启多个重连定时器
         reconnectTimer?.invalidate()
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
-            print("正在尝试自动重连...")
             self?.connectWebSocket()
         }
     }
@@ -149,22 +150,16 @@ class StatusBarController: NSObject, NSMenuDelegate {
         reconnectTimer?.invalidate()
     }
     
-    // MARK: - 数据处理
     private func parsePrice(_ text: String) {
-        // 过滤掉 OKX 的 pong 回复
         if text == "pong" { return }
-        
         guard let data = text.data(using: .utf8) else { return }
         do {
             let response = try JSONDecoder().decode(OKXResponse.self, from: data)
             if let lastPrice = response.data?.first?.last, let priceDouble = Double(lastPrice) {
-                // 显示完整整数部分，如需显示前三位可改回你的逻辑
                 let displayPrice = String(String(format: "%.0f", priceDouble).prefix(3))
                 updateTitle(displayPrice)
             }
-        } catch {
-            // 解析失败通常是收到频道订阅成功的确认消息，忽略即可
-        }
+        } catch {}
     }
     
     private func updateTitle(_ title: String) {
