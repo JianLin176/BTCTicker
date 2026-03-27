@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 // MARK: - WebSocket 数据模型
 struct OKXResponse: Codable {
@@ -9,44 +10,50 @@ struct TickerData: Codable {
     let last: String
 }
 
-// MARK: - 菜单栏控制器
-class StatusBarController {
-    private var statusBar: NSStatusBar
+// MARK: - 状态栏控制器
+class StatusBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem
     private var webSocketTask: URLSessionWebSocketTask?
+    private let url = URL(string: "wss://ws.okx.com:8443/ws/v5/public")!
     
-    init() {
-        statusBar = NSStatusBar.system
-        // 创建菜单栏实例
-        statusItem = statusBar.statusItem(withLength: NSStatusItem.variableLength)
+    override init() {
+        // 1. 初始化状态栏
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        
+        super.init()
         
         if let button = statusItem.button {
-            button.title = "BTC: --"
-            button.action = #selector(handleMenuAction)
-            button.target = self
-            // 允许右键菜单
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.title = "₿ 连接中..."
         }
         
         setupMenu()
         connectWebSocket()
     }
     
-    // 设置点击菜单
     private func setupMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "刷新/重置连接", action: #selector(resetConnection), keyEquivalent: "r"))
+        menu.delegate = self
+        // 重要：关闭自动禁用功能，防止断网时菜单变灰
+        menu.autoenablesItems = false
+        
+        let refreshItem = NSMenuItem(title: "刷新/重置连接", action: #selector(resetConnection), keyEquivalent: "r")
+        refreshItem.target = self
+        refreshItem.isEnabled = true // 强制开启
+        menu.addItem(refreshItem)
+        
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
+        
+        let quitItem = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        quitItem.isEnabled = true
+        menu.addItem(quitItem)
+        
         statusItem.menu = menu
-    }
-    
-    @objc func handleMenuAction() {
-        // 这里可以处理单击逻辑，目前已由 setupMenu 接管
     }
 
     @objc func resetConnection() {
-        print("正在重置连接...")
+        print("手动重置连接...")
+        updateTitle("重连中...")
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         connectWebSocket()
     }
@@ -57,7 +64,6 @@ class StatusBarController {
 
     // MARK: - WebSocket 逻辑
     func connectWebSocket() {
-        let url = URL(string: "wss://ws.okx.com:8443/ws/v5/public")!
         let session = URLSession(configuration: .default)
         webSocketTask = session.webSocketTask(with: url)
         webSocketTask?.resume()
@@ -70,9 +76,11 @@ class StatusBarController {
         }
         """
         let message = URLSessionWebSocketTask.Message.string(subscribeMsg)
-        webSocketTask?.send(message) { error in
+        
+        webSocketTask?.send(message) { [weak self] error in
             if let error = error {
-                print("发送失败: \(error)")
+                print("发送订阅失败: \(error)")
+                self?.updateTitle("网络错误")
             }
         }
         
@@ -88,14 +96,12 @@ class StatusBarController {
                     self?.parsePrice(text)
                 default: break
                 }
-                // 递归调用以保持监听
                 self?.receiveMessage()
                 
             case .failure(let error):
-                print("连接错误: \(error)")
-                DispatchQueue.main.async {
-                    self?.statusItem.button?.title = "连接失败"
-                }
+                print("WebSocket 收到错误: \(error)")
+                self?.updateTitle("已断开")
+                // 注意：这里不自动重连，等待用户手动刷新或你可以加个 Timer
             }
         }
     }
@@ -103,19 +109,21 @@ class StatusBarController {
     private func parsePrice(_ text: String) {
         guard let data = text.data(using: .utf8) else { return }
         do {
-            let decoder = JSONDecoder()
-            let response = try decoder.decode(OKXResponse.self, from: data)
-            if let lastPrice = response.data?.first?.last {
-                // 格式化价格，去掉小数
-                if let priceDouble = Double(lastPrice) {
-                    let formattedPrice = String(format: "%.0f", priceDouble)
-                    DispatchQueue.main.async {
-                        self.statusItem.button?.title = "₿ \(formattedPrice)"
-                    }
-                }
+            let response = try JSONDecoder().decode(OKXResponse.self, from: data)
+            if let lastPrice = response.data?.first?.last, let priceDouble = Double(lastPrice) {
+                let formattedPrice = String(format: "%.0f", priceDouble)
+                updateTitle("\(formattedPrice)")
             }
         } catch {
-            // 忽略非 ticker 数据包的解析错误
+            // 忽略非 Ticker 数据的解析失败
+        }
+    }
+    
+    private func updateTitle(_ title: String) {
+        DispatchQueue.main.async {
+            if let button = self.statusItem.button {
+                button.title = "\(title)"
+            }
         }
     }
 }
@@ -123,13 +131,22 @@ class StatusBarController {
 // MARK: - App 入口
 @main
 struct BtcTickerApp: App {
-    // 保持控制器引用，防止被垃圾回收
-    @State private var controller = StatusBarController()
+    // 使用 NSApplicationDelegateAdaptor 来管理生命周期更稳妥
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
     var body: some Scene {
-        // 隐藏主窗口
+        // macOS 13+ 隐藏菜单栏 App 的默认窗口
         Settings {
             EmptyView()
         }
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var statusBarController: StatusBarController?
+    
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 在应用启动后创建控制器
+        statusBarController = StatusBarController()
     }
 }
