@@ -5,6 +5,7 @@ import Combine
 // MARK: - WebSocket 数据模型
 struct OKXResponse: Codable {
     let data: [TickerData]?
+    let event: String? // 用于识别 pong 等事件
 }
 struct TickerData: Codable {
     let last: String
@@ -16,10 +17,13 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private var webSocketTask: URLSessionWebSocketTask?
     private let url = URL(string: "wss://ws.okx.com:8443/ws/v5/public")!
     
+    // 自动重连与心跳管理
+    private var reconnectTimer: Timer?
+    private var pingTimer: Timer?
+    private var isIntentionallyDisconnected = false
+
     override init() {
-        // 1. 初始化状态栏
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        
         super.init()
         
         if let button = statusItem.button {
@@ -33,42 +37,52 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private func setupMenu() {
         let menu = NSMenu()
         menu.delegate = self
-        // 重要：关闭自动禁用功能，防止断网时菜单变灰
         menu.autoenablesItems = false
         
-        let refreshItem = NSMenuItem(title: "刷新/重置连接", action: #selector(resetConnection), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "手动重连", action: #selector(manualReset), keyEquivalent: "r")
         refreshItem.target = self
-        refreshItem.isEnabled = true // 强制开启
         menu.addItem(refreshItem)
         
         menu.addItem(NSMenuItem.separator())
         
         let quitItem = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
-        quitItem.isEnabled = true
         menu.addItem(quitItem)
         
         statusItem.menu = menu
     }
 
-    @objc func resetConnection() {
-        print("手动重置连接...")
-        updateTitle("重连中...")
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
-        connectWebSocket()
+    @objc func manualReset() {
+        print("手动触发重连...")
+        reconnect()
     }
 
     @objc func quitApp() {
+        stopTimers()
+        isIntentionallyDisconnected = true
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
         NSApp.terminate(nil)
     }
 
-    // MARK: - WebSocket 逻辑
+    // MARK: - WebSocket 核心逻辑
     func connectWebSocket() {
+        // 重置状态
+        stopTimers()
+        isIntentionallyDisconnected = false
+        
         let session = URLSession(configuration: .default)
         webSocketTask = session.webSocketTask(with: url)
         webSocketTask?.resume()
         
-        // 发送订阅消息
+        // 1. 发送订阅
+        sendSubscribeMessage()
+        // 2. 开始接收消息
+        receiveMessage()
+        // 3. 启动心跳 (每20秒发送一次 ping)
+        startPingTimer()
+    }
+    
+    private func sendSubscribeMessage() {
         let subscribeMsg = """
         {
             "op": "subscribe",
@@ -76,53 +90,87 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
         """
         let message = URLSessionWebSocketTask.Message.string(subscribeMsg)
-        
-        webSocketTask?.send(message) { [weak self] error in
+        webSocketTask?.send(message) { error in
             if let error = error {
-                print("发送订阅失败: \(error)")
-                self?.updateTitle("网络错误")
+                print("订阅发送失败: \(error)")
             }
         }
-        
-        receiveMessage()
     }
-    
+
     private func receiveMessage() {
         webSocketTask?.receive { [weak self] result in
+            guard let self = self else { return }
+            
             switch result {
             case .success(let message):
-                switch message {
-                case .string(let text):
-                    self?.parsePrice(text)
-                default: break
+                if case .string(let text) = message {
+                    self.parsePrice(text)
                 }
-                self?.receiveMessage()
+                // 成功后继续监听
+                self.receiveMessage()
                 
             case .failure(let error):
-                print("WebSocket 收到错误: \(error)")
-                self?.updateTitle("已断开")
-                // 注意：这里不自动重连，等待用户手动刷新或你可以加个 Timer
+                print("WebSocket 连接丢失: \(error.localizedDescription)")
+                if !self.isIntentionallyDisconnected {
+                    self.updateTitle("重连中...")
+                    self.scheduleReconnect()
+                }
             }
         }
     }
     
+    // MARK: - 心跳与重连机制
+    private func startPingTimer() {
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            self?.webSocketTask?.send(.string("ping")) { error in
+                if let error = error {
+                    print("Ping 失败: \(error)")
+                }
+            }
+        }
+    }
+    
+    private func scheduleReconnect() {
+        // 防止重复开启多个重连定时器
+        reconnectTimer?.invalidate()
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
+            print("正在尝试自动重连...")
+            self?.connectWebSocket()
+        }
+    }
+    
+    private func reconnect() {
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        connectWebSocket()
+    }
+    
+    private func stopTimers() {
+        pingTimer?.invalidate()
+        reconnectTimer?.invalidate()
+    }
+    
+    // MARK: - 数据处理
     private func parsePrice(_ text: String) {
+        // 过滤掉 OKX 的 pong 回复
+        if text == "pong" { return }
+        
         guard let data = text.data(using: .utf8) else { return }
         do {
             let response = try JSONDecoder().decode(OKXResponse.self, from: data)
             if let lastPrice = response.data?.first?.last, let priceDouble = Double(lastPrice) {
-                let formattedPrice = String(format: "%.0f", priceDouble)
-                updateTitle("\(formattedPrice)")
+                // 显示完整整数部分，如需显示前三位可改回你的逻辑
+                let displayPrice = String(String(format: "%.0f", priceDouble).prefix(3))
+                updateTitle(displayPrice)
             }
         } catch {
-            // 忽略非 Ticker 数据的解析失败
+            // 解析失败通常是收到频道订阅成功的确认消息，忽略即可
         }
     }
     
     private func updateTitle(_ title: String) {
         DispatchQueue.main.async {
             if let button = self.statusItem.button {
-                button.title = "\(title)"
+                button.title = title
             }
         }
     }
@@ -131,11 +179,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
 // MARK: - App 入口
 @main
 struct BtcTickerApp: App {
-    // 使用 NSApplicationDelegateAdaptor 来管理生命周期更稳妥
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
     var body: some Scene {
-        // macOS 13+ 隐藏菜单栏 App 的默认窗口
         Settings {
             EmptyView()
         }
@@ -146,7 +192,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusBarController: StatusBarController?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 在应用启动后创建控制器
         statusBarController = StatusBarController()
     }
 }
