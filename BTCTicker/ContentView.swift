@@ -11,17 +11,40 @@ struct TickerData: Codable {
     let last: String
 }
 
+// MARK: - 币种配置
+enum Coin: String, CaseIterable {
+    case btc = "BTC"
+    case mu = "MU"
+
+    var instId: String {
+        self == .btc ? "BTC-USDT" : "MU-USDT-SWAP"
+    }
+
+    // 菜单栏显示前缀
+    var label: String {
+        self == .btc ? "B" : "M"
+    }
+}
+
 // MARK: - 状态栏控制器
 class StatusBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem
     private var webSocketTask: URLSessionWebSocketTask?
     private let url = URL(string: "wss://ws.okx.com:8443/ws/v5/public")!
-    
+
     private var pingTimer: Timer?
     private var globalMonitor: Any?
+    private var currentCoin: Coin
+    private var coinSubMenu: NSMenu?
 
     override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // 读取上次选择的币种，读不到默认 BTC
+        if let saved = UserDefaults.standard.string(forKey: "selectedCoin"), let coin = Coin(rawValue: saved) {
+            currentCoin = coin
+        } else {
+            currentCoin = .btc
+        }
         super.init()
         
         if let button = statusItem.button {
@@ -68,7 +91,23 @@ class StatusBarController: NSObject, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         menu.autoenablesItems = false
-        
+
+        // 切换币种子菜单（右侧展开 BTC / MU）
+        let switchItem = NSMenuItem(title: "切换币种", action: nil, keyEquivalent: "")
+        let subMenu = NSMenu()
+        for coin in Coin.allCases {
+            let item = NSMenuItem(title: coin.rawValue, action: #selector(switchCoin(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = coin
+            item.state = (coin == currentCoin) ? .on : .off
+            subMenu.addItem(item)
+        }
+        coinSubMenu = subMenu
+        switchItem.submenu = subMenu
+        menu.addItem(switchItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         // 菜单项显示快捷键提示: ⌃⌥⇧B
         let refreshItem = NSMenuItem(title: "手动重连", action: #selector(manualReset), keyEquivalent: "b")
         refreshItem.keyEquivalentModifierMask = [.control, .option, .shift]
@@ -82,6 +121,25 @@ class StatusBarController: NSObject, NSMenuDelegate {
         menu.addItem(quitItem)
         
         statusItem.menu = menu
+    }
+
+    @objc private func switchCoin(_ sender: NSMenuItem) {
+        guard let coin = sender.representedObject as? Coin, coin != currentCoin else { return }
+        currentCoin = coin
+        UserDefaults.standard.set(coin.rawValue, forKey: "selectedCoin")
+
+        // 更新子菜单勾选状态
+        if let subMenu = coinSubMenu {
+            for item in subMenu.items {
+                if let c = item.representedObject as? Coin {
+                    item.state = (c == currentCoin) ? .on : .off
+                }
+            }
+        }
+
+        print("切换币种：\(coin.rawValue)")
+        updateTitle("🔄...")
+        reconnect()
     }
 
     @objc func manualReset() {
@@ -112,7 +170,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
     
     private func sendSubscribeMessage() {
-        let subscribeMsg = "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"tickers\",\"instId\":\"BTC-USDT\"}]}"
+        let subscribeMsg = "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"tickers\",\"instId\":\"\(currentCoin.instId)\"}]}"
         webSocketTask?.send(.string(subscribeMsg)) { _ in }
     }
 
@@ -156,7 +214,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
            let lastPrice = response.data?.first?.last,
            let priceDouble = Double(lastPrice) {
             let displayPrice = String(String(format: "%.0f", priceDouble).prefix(3))
-            updateTitle("\(displayPrice)")
+            updateTitle("\(currentCoin.label) \(displayPrice)")
         }
     }
     
