@@ -6,12 +6,16 @@ import Combine
 struct OKXResponse: Codable {
     let data: [TickerData]?
     let event: String?
+    let arg: SubscribeArg?
 }
 struct TickerData: Codable {
     let last: String
 }
+struct SubscribeArg: Codable {
+    let instId: String?
+}
 
-// MARK: - 币种配置
+// MARK: - 币种配置（菜单保留，实际不再用于订阅）
 enum Coin: String, CaseIterable {
     case btc = "BTC"
     case mu = "MU"
@@ -34,12 +38,16 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     private var pingTimer: Timer?
     private var globalMonitor: Any?
-    private var currentCoin: Coin
+    private var currentCoin: Coin // 仅用于菜单展示，不再控制订阅
     private var coinSubMenu: NSMenu?
+    
+    // 缓存两个币种价格
+    private var btcPrice: String?
+    private var muPrice: String?
 
     override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        // 读取上次选择的币种，读不到默认 BTC
+        // 读取上次选择的币种，读不到默认 BTC（仅菜单使用）
         if let saved = UserDefaults.standard.string(forKey: "selectedCoin"), let coin = Coin(rawValue: saved) {
             currentCoin = coin
         } else {
@@ -92,7 +100,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
 
-        // 切换币种子菜单（右侧展开 BTC / MU）
+        // 切换币种子菜单（保留UI，仅修改勾选状态，不控制行情订阅）
         let switchItem = NSMenuItem(title: "切换币种", action: nil, keyEquivalent: "")
         let subMenu = NSMenu()
         for coin in Coin.allCases {
@@ -136,10 +144,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
                 }
             }
         }
-
-        print("切换币种：\(coin.rawValue)")
-        updateTitle("🔄...")
-        reconnect()
+        print("【菜单切换】仅更新菜单选中，行情仍然同时拉取 BTC+MU：\(coin.rawValue)")
+        // 不再调用 reconnect()，菜单操作不影响行情
     }
 
     @objc func manualReset() {
@@ -160,6 +166,10 @@ class StatusBarController: NSObject, NSMenuDelegate {
     // MARK: - WebSocket 逻辑
     func connectWebSocket() {
         stopTimers()
+        // 清空缓存价格
+        btcPrice = nil
+        muPrice = nil
+        
         let session = URLSession(configuration: .default)
         webSocketTask = session.webSocketTask(with: url)
         webSocketTask?.resume()
@@ -170,7 +180,16 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
     
     private func sendSubscribeMessage() {
-        let subscribeMsg = "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"tickers\",\"instId\":\"\(currentCoin.instId)\"}]}"
+        // 一次性订阅 BTC-USDT + MU-USDT-SWAP
+        let subscribeMsg = """
+        {
+            "op":"subscribe",
+            "args":[
+                {"channel":"tickers","instId":"BTC-USDT"},
+                {"channel":"tickers","instId":"MU-USDT-SWAP"}
+            ]
+        }
+        """
         webSocketTask?.send(.string(subscribeMsg)) { _ in }
     }
 
@@ -210,12 +229,25 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private func parsePrice(_ text: String) {
         if text == "pong" { return }
         guard let data = text.data(using: .utf8) else { return }
-        if let response = try? JSONDecoder().decode(OKXResponse.self, from: data),
-           let lastPrice = response.data?.first?.last,
-           let priceDouble = Double(lastPrice) {
-            let displayPrice = String(String(format: "%.0f", priceDouble).prefix(3))
-            updateTitle("\(currentCoin.label) \(displayPrice)")
+        guard let response = try? JSONDecoder().decode(OKXResponse.self, from: data),
+              let instId = response.arg?.instId,
+              let priceStr = response.data?.first?.last,
+              let priceNum = Double(priceStr) else {
+            return
         }
+        
+        let priceDisplay = String(format: "%.0f", priceNum)
+        if instId == "BTC-USDT" {
+            // BTC 截取前3位
+            btcPrice = String(priceDisplay.prefix(4))
+        } else if instId == "MU-USDT-SWAP" {
+            // MU 截取前4位，不足4位全部展示
+            muPrice = String(priceDisplay.prefix(4))
+        }
+        
+        // 两个币种都拿到价格，更新状态栏
+        guard let b = btcPrice, let m = muPrice else { return }
+        updateTitle("M:\(m) B:\(b)")
     }
     
     private func updateTitle(_ title: String) {
